@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0B1220" />
+  <title>QR Sentry — QR Code Link Safety Scanner</title>
+
+  <!--
+    Content Security Policy
+    - script-src 'self' only: every script is vendored locally, nothing is
+      loaded from a CDN at runtime.
+    - connect-src allows the optional Google Safe Browsing endpoint (only
+      ever called if the user supplies their own API key in Settings).
+    - frame-ancestors / form-action 'none': this page should never be
+      framed and never submits forms.
+  -->
+  <meta http-equiv="Content-Security-Policy" content="
+    default-src 'self';
+    script-src 'self';
+    style-src 'self' 'unsafe-inline';
+    img-src 'self' data: blob:;
+    media-src 'self' blob:;
+    connect-src 'self' https://*.workers.dev;
+    worker-src 'self' blob:;
+    object-src 'none';
+    base-uri 'self';
+    form-action 'none';
+    frame-ancestors 'none';
+  " />
+
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='%232DD4BF' d='M12 1l8 4v6c0 5-3.5 8.5-8 11-4.5-2.5-8-6-8-11V5z'/%3E%3Cpath fill='%230B1220' d='M9.5 12.5l1.8 1.8L15 10.6' stroke='%230B1220' stroke-width='1.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E" />
+
+  <link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+  <div class="app">
+
+    <header class="app-header">
+      <div class="brand">
+        <svg class="brand-icon" viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M12 1l8 4v6c0 5-3.5 8.5-8 11-4.5-2.5-8-6-8-11V5z" />
+          <path class="brand-check" d="M8.5 12.2l2.3 2.3L15.8 9.4" />
+        </svg>
+        <span class="brand-name">QR Sentry</span>
+      </div>
+      <button id="settings-btn" class="icon-btn" type="button" aria-label="Settings" aria-haspopup="dialog">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M19.4 13a7.6 7.6 0 0 0 0-2l2-1.6-2-3.4-2.4 1a7.7 7.7 0 0 0-1.7-1L15 3h-4l-.3 2.4a7.7 7.7 0 0 0-1.7 1l-2.4-1-2 3.4L6.6 11a7.6 7.6 0 0 0 0 2l-2 1.6 2 3.4 2.4-1a7.7 7.7 0 0 0 1.7 1L11 21h4l.3-2.4a7.7 7.7 0 0 0 1.7-1l2.4 1 2-3.4z"/>
+          <circle cx="12" cy="12" r="3"/>
+        </svg>
+      </button>
+    </header>
+
+    <main id="main">
+
+      <!-- ============ HOME VIEW ============ -->
+      <section id="view-home" class="view">
+        <div class="hero">
+          <h1>Know where that QR code <span class="accent">really</span> leads.</h1>
+          <p class="lede">
+            Scan a QR code with your camera and QR Sentry checks the link for common
+            phishing and malware patterns &mdash; <em>before</em> you open it.
+          </p>
+        </div>
+
+        <button id="start-scan-btn" class="btn btn-primary btn-large" type="button">
+          <svg viewBox="0 0 24 24" aria-hidden="true" class="btn-icon">
+            <path d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4z"/>
+            <path d="M14 14h2.5v2.5H14zM18.5 14H21v2.5h-2.5zM14 18.5h2.5V21H14zM18.5 18.5H21V21h-2.5z"/>
+          </svg>
+          Scan a QR code
+        </button>
+
+        <div class="upload-row">
+          <span>or</span>
+          <label class="link-btn" for="file-input">upload a photo of one</label>
+          <input id="file-input" type="file" accept="image/*" hidden />
+        </div>
+
+        <p id="home-status" class="status-text" role="status" aria-live="polite"></p>
+
+        <section class="recent" aria-labelledby="recent-heading">
+          <div class="recent-header">
+            <h2 id="recent-heading">Recent scans</h2>
+            <button id="clear-history-btn" class="link-btn" type="button" hidden>Clear</button>
+          </div>
+          <ul id="recent-list" class="recent-list"></ul>
+          <p id="recent-empty" class="empty-text">Nothing scanned yet on this device.</p>
+        </section>
+
+        <p class="disclaimer">
+          QR Sentry checks the <strong>structure</strong> of a link for warning signs.
+          It cannot guarantee a site is safe or unsafe &mdash; always use your judgment,
+          especially before entering passwords or payment details.
+        </p>
+      </section>
+
+      <!-- ============ SCANNER VIEW ============ -->
+      <section id="view-scanner" class="view" hidden>
+        <div class="scanner-frame">
+          <div id="qr-reader" class="qr-reader"></div>
+          <div class="reticle" aria-hidden="true">
+            <span class="corner tl"></span>
+            <span class="corner tr"></span>
+            <span class="corner bl"></span>
+            <span class="corner br"></span>
+          </div>
+        </div>
+        <p id="scanner-status" class="status-text" role="status" aria-live="polite">Starting camera&hellip;</p>
+        <button id="cancel-scan-btn" class="btn btn-secondary" type="button">Cancel</button>
+      </section>
+
+      <!-- ============ RESULTS VIEW ============ -->
+      <section id="view-results" class="view" hidden aria-labelledby="results-heading">
+        <h1 id="results-heading" class="visually-hidden">Scan results</h1>
+
+        <div id="verdict-card" class="verdict-card">
+          <div class="verdict-ring" id="verdict-ring">
+            <span id="verdict-score" class="verdict-score"></span>
+          </div>
+          <div class="verdict-text">
+            <p id="verdict-label" class="verdict-label"></p>
+            <p id="verdict-sub" class="verdict-sub"></p>
+          </div>
+        </div>
+
+        <section class="content-card" aria-labelledby="scanned-heading">
+          <h2 id="scanned-heading">Scanned content</h2>
+          <p id="scanned-content" class="scanned-content"></p>
+          <div class="content-actions">
+            <button id="copy-btn" class="btn btn-secondary btn-small" type="button">Copy</button>
+            <button id="open-btn" class="btn btn-secondary btn-small" type="button" hidden>Open</button>
+          </div>
+          <p id="copy-feedback" class="status-text" role="status" aria-live="polite"></p>
+        </section>
+
+        <section class="findings-section" aria-labelledby="findings-heading">
+          <h2 id="findings-heading">What we found</h2>
+          <ul id="findings-list" class="findings-list"></ul>
+          <p id="safebrowsing-status" class="status-text" role="status" aria-live="polite"></p>
+        </section>
+
+        <button id="scan-again-btn" class="btn btn-primary" type="button">Scan another code</button>
+      </section>
+
+    </main>
+
+    <footer class="app-footer">
+      <p>Runs entirely in your browser. Scanned content is analyzed on-device and never sent anywhere unless you enable the optional Safe Browsing check.</p>
+    </footer>
+  </div>
+
+  <!-- ============ SETTINGS DIALOG ============ -->
+  <dialog id="settings-dialog" aria-labelledby="settings-heading">
+    <form id="settings-form">
+      <h2 id="settings-heading">Settings</h2>
+
+      <div class="field">
+        <label for="safebrowsing-key">Safe Browsing proxy URL <span class="optional">(optional)</span></label>
+        <input id="safebrowsing-key" type="url" autocomplete="off" spellcheck="false"
+               placeholder="https://your-worker.workers.dev" />
+        <p class="field-help">
+          Adds a cross-check against Google's database of known malicious sites,
+          via your own Cloudflare Worker proxy. The Worker keeps your Google API
+          key private &mdash; only its public URL is stored here, in this browser.
+          See the project README for setup instructions.
+        </p>
+      </div>
+
+      <div class="dialog-actions">
+        <button type="button" id="settings-cancel" class="btn btn-secondary">Cancel</button>
+        <button type="submit" id="settings-save" class="btn btn-primary">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Vendored locally — no third-party script execution at runtime. -->
+  <script src="vendor/html5-qrcode.min.js"></script>
+  <script src="js/analyzer.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>

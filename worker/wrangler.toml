@@ -1,0 +1,8 @@
+name = "qr-sentry-safebrowsing-proxy"
+main = "worker.js"
+compatibility_date = "2024-01-01"
+
+# The actual API key is NOT stored here. Set it as a secret with:
+#   wrangler secret put SAFE_BROWSING_API_KEY
+# This keeps it out of source control and out of the Cloudflare dashboard's
+# plaintext variable list.
