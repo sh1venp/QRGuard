@@ -65,6 +65,13 @@
   const SETTINGS_KEY = 'qrSentry.settings';
   const MAX_HISTORY = 8;
 
+  // Public default endpoint so the tool works out of the box for every
+  // visitor with no setup. This URL is not a secret — the Worker behind
+  // it holds the real API key server-side and enforces its own origin
+  // allowlist + rate limiting. Users can still override it in Settings
+  // (e.g. to point at their own Worker instance).
+  const DEFAULT_WORKER_ENDPOINT = 'https://qr-sentry-safebrowsing-proxy.sh1venp.workers.dev';
+
   const SEVERITY_LABELS = {
     critical: 'Critical',
     high: 'High',
@@ -72,6 +79,11 @@
     low: 'Low',
     info: 'Info'
   };
+
+  function getWorkerEndpoint() {
+    const settings = loadSettings();
+    return (settings.workerEndpoint || DEFAULT_WORKER_ENDPOINT || '').trim();
+  }
 
   // ---- State --------------------------------------------------------------
   let html5QrCode = null;
@@ -344,8 +356,122 @@
     showView(viewResults);
 
     if (result.type === 'url') {
-      maybeCheckSafeBrowsing(result);
+      if (result.isShortener) {
+        resolveShortenerAndRerender(result);
+      } else {
+        maybeCheckSafeBrowsing(result);
+      }
     }
+  }
+
+  /**
+   * For a known link-shortener URL, ask the Worker to follow the redirect
+   * chain server-side (the browser can't safely do this itself — see
+   * worker.js for the SSRF protections involved), then re-run the same
+   * heuristic analysis against the REAL destination and merge the two
+   * result sets so the user sees both "this is a shortener" and whatever
+   * the actual target looks like.
+   */
+  async function resolveShortenerAndRerender(shortenerResult) {
+    const endpoint = getWorkerEndpoint();
+    if (!endpoint) return; // no Worker configured at all — nothing to resolve with
+
+    safebrowsingStatus.textContent = 'Following the shortened link\u2026';
+
+    let resolved;
+    try {
+      resolved = await QRAnalyzer.resolveRedirects(shortenerResult.url.toString(), endpoint);
+    } catch (_) {
+      safebrowsingStatus.textContent = 'Could not look up where this shortened link leads.';
+      // Still worth checking the shortener URL itself against Safe Browsing.
+      maybeCheckSafeBrowsing(shortenerResult);
+      return;
+    }
+
+    let finalUrlObj;
+    try {
+      finalUrlObj = new URL(resolved.finalUrl);
+    } catch (_) {
+      safebrowsingStatus.textContent = '';
+      maybeCheckSafeBrowsing(shortenerResult);
+      return;
+    }
+
+    const sameDestination = finalUrlObj.toString() === shortenerResult.url.toString();
+    const finalAnalysis = sameDestination ? shortenerResult.analysis : QRAnalyzer.analyzeUrl(finalUrlObj, resolved.finalUrl);
+
+    // Merge: keep the "this is a shortened link" finding, add everything
+    // found about the real destination, and prepend a clear summary of
+    // where it actually leads.
+    const mergedFindings = [];
+
+    mergedFindings.push({
+      severity: resolved.truncated ? 'medium' : 'info',
+      title: resolved.truncated ? 'Could not fully resolve the destination' : 'Shortened link resolved',
+      detail: resolved.truncated
+        ? `We followed ${resolved.hopCount} redirect${resolved.hopCount === 1 ? '' : 's'} but could not safely reach a final destination ` +
+          '(it may point at a private/internal address, an unsupported link type, or too many redirects). Treat this link with extra caution.'
+        : `This shortened link leads to: ${finalUrlObj.hostname}${finalUrlObj.pathname}` +
+          (resolved.hopCount > 1 ? ` (via ${resolved.hopCount - 1} intermediate redirect${resolved.hopCount - 1 === 1 ? '' : 's'})` : '')
+    });
+
+    mergedFindings.push(...finalAnalysis.findings);
+
+    const merged = finalize_compat(mergedFindings);
+
+    setVerdict(merged.verdict, merged.label, merged.score);
+    if (merged.verdict === 'high') {
+      verdictSub.textContent = 'The destination of this shortened link shows strong signs of being unsafe.';
+    } else if (merged.verdict === 'medium') {
+      verdictSub.textContent = 'A few things about where this link leads are worth double-checking.';
+    } else {
+      verdictSub.textContent = "We didn't find anything unusual about the resolved destination.";
+    }
+    renderFindings(merged.findings);
+
+    const finalScheme = finalUrlObj.protocol.replace(':', '').toLowerCase();
+    if (!QRAnalyzer.DANGEROUS_SCHEMES.includes(finalScheme)) {
+      currentOpenUrl = finalUrlObj;
+      openBtn.hidden = false;
+      openBtn.textContent = 'Open link';
+    } else {
+      openBtn.hidden = true;
+      currentOpenUrl = null;
+    }
+
+    safebrowsingStatus.textContent = '';
+
+    // Cross-check the REAL destination against Safe Browsing, not the
+    // shortener wrapper.
+    maybeCheckSafeBrowsing({ url: finalUrlObj });
+  }
+
+  /**
+   * Recompute score/verdict for a merged findings list using the same
+   * weighting the analyzer uses internally. Kept here (rather than calling
+   * private analyzer internals) since this is purely a presentation-layer
+   * merge of two already-computed finding sets.
+   */
+  function finalize_compat(findings) {
+    const weight = { critical: 60, high: 25, medium: 12, low: 6, info: 0 };
+    let score = 100;
+    for (const f of findings) score -= weight[f.severity] || 0;
+    score = Math.max(0, Math.min(100, score));
+
+    const hasCritical = findings.some((f) => f.severity === 'critical');
+    let verdict;
+    let label;
+    if (hasCritical || score < 45) {
+      verdict = 'high';
+      label = 'High Risk';
+    } else if (score < 80) {
+      verdict = 'medium';
+      label = 'Use Caution';
+    } else {
+      verdict = 'low';
+      label = 'Likely Safe';
+    }
+    return { score, verdict, label, findings };
   }
 
   function typeLabel(type) {
@@ -576,8 +702,7 @@
   // Optional Google Safe Browsing cross-check
   // -----------------------------------------------------------------------
   async function maybeCheckSafeBrowsing(result) {
-    const settings = loadSettings();
-    const endpoint = settings.workerEndpoint;
+    const endpoint = getWorkerEndpoint();
     if (!endpoint) return;
 
     const scheme = result.url.protocol.replace(':', '').toLowerCase();

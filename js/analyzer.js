@@ -175,7 +175,10 @@
 
     const url = tryParseUrl(trimmed);
     if (url) {
-      return { type: 'url', raw: trimmed, url, analysis: analyzeUrl(url, trimmed) };
+      const scheme = url.protocol.replace(':', '').toLowerCase();
+      const bareHost = url.hostname.toLowerCase().replace(/^www\./, '');
+      const isShortener = (scheme === 'http' || scheme === 'https') && URL_SHORTENERS.includes(bareHost);
+      return { type: 'url', raw: trimmed, url, isShortener, analysis: analyzeUrl(url, trimmed) };
     }
 
     return { type: 'text', raw: trimmed };
@@ -449,11 +452,13 @@
    * how to surface that.
    *
    * @param {string} targetUrl - the full URL to check.
-   * @param {string} workerEndpoint - the Cloudflare Worker URL, e.g.
+   * @param {string} workerBaseUrl - the Cloudflare Worker base URL, e.g.
    *   "https://qr-sentry-safebrowsing-proxy.YOUR-SUBDOMAIN.workers.dev".
    */
-  async function checkSafeBrowsing(targetUrl, workerEndpoint) {
-    const response = await fetch(workerEndpoint, {
+  async function checkSafeBrowsing(targetUrl, workerBaseUrl) {
+    const endpoint = workerBaseUrl.replace(/\/$/, '') + '/safebrowsing';
+
+    const response = await fetch(endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ url: targetUrl })
@@ -477,14 +482,58 @@
     };
   }
 
+  /**
+   * Ask the Worker to follow a URL's redirect chain (e.g. a shortener) and
+   * report the real final destination. The Worker performs SSRF checks on
+   * every hop server-side before connecting, which a browser cannot do for
+   * itself. Throws on network/HTTP errors so the caller can decide how to
+   * surface that — callers should treat a thrown error as "could not
+   * resolve" and fall back to analyzing the shortened link as-is.
+   *
+   * @param {string} targetUrl - the shortened/redirecting URL to resolve.
+   * @param {string} workerBaseUrl - the Cloudflare Worker base URL.
+   * @returns {{finalUrl: string, hops: Array, hopCount: number, truncated: boolean}}
+   */
+  async function resolveRedirects(targetUrl, workerBaseUrl) {
+    const endpoint = workerBaseUrl.replace(/\/$/, '') + '/resolve';
+
+    const response = await fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: targetUrl })
+    });
+
+    if (!response.ok) {
+      let detail = '';
+      try {
+        const body = await response.json();
+        detail = body && body.error ? body.error : '';
+      } catch (_) {
+        // ignore
+      }
+      throw new Error('Redirect resolution failed (HTTP ' + response.status + ')' + (detail ? ': ' + detail : ''));
+    }
+
+    const data = await response.json();
+    return {
+      finalUrl: typeof data.finalUrl === 'string' ? data.finalUrl : targetUrl,
+      hops: Array.isArray(data.hops) ? data.hops : [],
+      hopCount: typeof data.hopCount === 'number' ? data.hopCount : 0,
+      truncated: Boolean(data.truncated)
+    };
+  }
+
   // ---------------------------------------------------------------------
   // Public API
   // ---------------------------------------------------------------------
 
   window.QRAnalyzer = {
     classify,
+    analyzeUrl,
     checkSafeBrowsing,
+    resolveRedirects,
     DANGEROUS_SCHEMES,
-    NON_WEB_SCHEMES
+    NON_WEB_SCHEMES,
+    URL_SHORTENERS
   };
 })();

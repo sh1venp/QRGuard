@@ -1,19 +1,30 @@
 /**
- * Cloudflare Worker: Safe Browsing proxy
+ * Cloudflare Worker: Safe Browsing proxy + redirect resolver
  *
- * Purpose: lets the QR Sentry frontend check a URL against Google Safe
- * Browsing WITHOUT ever exposing the Safe Browsing API key to the browser.
- * The key lives only as a Worker secret (server-side environment variable),
- * never in any JS shipped to the client.
+ * Purpose: lets the QR Sentry frontend (1) check a URL against Google Safe
+ * Browsing and (2) follow shortener redirect chains (bit.ly, tinyurl, etc.)
+ * to find the real destination — all WITHOUT ever exposing the Safe
+ * Browsing API key to the browser, and without letting the browser itself
+ * make cross-origin requests that a malicious redirect could abuse.
+ *
+ * Routes:
+ *   POST /safebrowsing   { url }  -> { flagged, threatTypes }
+ *   POST /resolve        { url }  -> { finalUrl, hops, hopCount, truncated }
  *
  * Security properties:
  *  - CORS is locked to an explicit allowlist of origins (your GitHub Pages
  *    URL). No wildcard "*".
  *  - Only POST is accepted, only a single well-formed `url` field is read
  *    from the body, and it is validated as http/https before use.
- *  - The Worker never echoes back arbitrary user input into responses
- *    beyond the boolean "flagged" result and threat type names from
- *    Google's own response.
+ *  - /resolve actively defends against SSRF: before connecting to ANY hop
+ *    (including the first), the hostname is resolved and checked against
+ *    private/loopback/link-local/reserved IP ranges, and rejected if it
+ *    matches. This stops a malicious shortener from using this Worker to
+ *    probe Cloudflare's internal network or cloud metadata endpoints.
+ *  - Redirect chains are capped (MAX_REDIRECTS) and time-limited, so a
+ *    pathological or infinite redirect chain can't tie up the Worker.
+ *  - The Worker never echoes back arbitrary response bodies from
+ *    upstream — only the resolved URL string and HTTP status per hop.
  *  - Basic per-IP rate limiting (in-memory, best-effort) to slow down abuse
  *    of your quota; Cloudflare's own DDoS protection sits in front of this
  *    regardless.
@@ -31,6 +42,9 @@ const ALLOWED_ORIGINS = [
 ];
 
 const SAFE_BROWSING_ENDPOINT = 'https://safebrowsing.googleapis.com/v4/threatMatches:find';
+
+const MAX_REDIRECTS = 10;
+const FETCH_TIMEOUT_MS = 6000;
 
 // Very small in-memory rate limiter. Resets whenever the Worker's
 // execution context recycles (which Cloudflare does periodically), so
@@ -84,9 +98,259 @@ function isHttpUrl(value) {
   }
 }
 
+// ---------------------------------------------------------------------
+// SSRF protection: reject hostnames/IPs that point at private, loopback,
+// link-local, or otherwise non-public address space. Cloud metadata
+// services (AWS/GCP/Azure all use 169.254.169.254) live in link-local
+// space, so blocking that range specifically matters.
+// ---------------------------------------------------------------------
+
+function ipv4ToInt(parts) {
+  return (
+    (parseInt(parts[0], 10) << 24) +
+    (parseInt(parts[1], 10) << 16) +
+    (parseInt(parts[2], 10) << 8) +
+    parseInt(parts[3], 10)
+  );
+}
+
+function isPrivateIpv4(host) {
+  const m = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (!m) return false;
+  const parts = m.slice(1).map(Number);
+  if (parts.some((p) => p > 255)) return false;
+
+  const ip = ipv4ToInt(parts);
+  const inRange = (base, maskBits) => {
+    const mask = maskBits === 0 ? 0 : (-1 << (32 - maskBits)) >>> 0;
+    return (ip & mask) === (ipv4ToInt(base) & mask);
+  };
+
+  return (
+    inRange([10, 0, 0, 0], 8) || // 10.0.0.0/8
+    inRange([172, 16, 0, 0], 12) || // 172.16.0.0/12
+    inRange([192, 168, 0, 0], 16) || // 192.168.0.0/16
+    inRange([127, 0, 0, 0], 8) || // loopback
+    inRange([169, 254, 0, 0], 16) || // link-local incl. cloud metadata
+    inRange([0, 0, 0, 0], 8) || // "this network"
+    inRange([100, 64, 0, 0], 10) || // shared address space (CGNAT)
+    inRange([192, 0, 0, 0], 24) || // IETF protocol assignments
+    inRange([198, 18, 0, 0], 15) || // benchmarking
+    inRange([224, 0, 0, 0], 4) // multicast
+  );
+}
+
+function isPrivateIpv6(host) {
+  const h = host.toLowerCase();
+  return (
+    h === '::1' || // loopback
+    h === '::' ||
+    h.startsWith('fe80:') || // link-local
+    h.startsWith('fc') || // unique local fc00::/7
+    h.startsWith('fd') ||
+    h.startsWith('::ffff:127.') || // IPv4-mapped loopback
+    h.startsWith('::ffff:10.') ||
+    h.startsWith('::ffff:169.254.')
+  );
+}
+
+/**
+ * Resolve a hostname to its IP addresses using DNS-over-HTTPS (Cloudflare's
+ * own 1.1.1.1 resolver) so we can inspect the actual IP before connecting,
+ * rather than trusting the hostname alone (which doesn't stop DNS rebinding
+ * to a private address).
+ */
+async function resolveHostIps(hostname) {
+  const lookupTypes = ['A', 'AAAA'];
+  const ips = [];
+
+  for (const type of lookupTypes) {
+    try {
+      const res = await fetch(
+        `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(hostname)}&type=${type}`,
+        { headers: { Accept: 'application/dns-json' } }
+      );
+      if (!res.ok) continue;
+      const data = await res.json();
+      if (Array.isArray(data.Answer)) {
+        for (const ans of data.Answer) {
+          if (ans && typeof ans.data === 'string') ips.push(ans.data);
+        }
+      }
+    } catch (_) {
+      // DNS lookup failure is treated as "couldn't verify" — caller decides.
+    }
+  }
+
+  return ips;
+}
+
+/**
+ * Returns true if `hostname` is safe to connect to: it must resolve to at
+ * least one IP, and none of its IPs may fall in private/reserved space.
+ */
+async function isSafeToFetch(hostname) {
+  // Reject if the hostname itself is a literal private/loopback IP.
+  if (isPrivateIpv4(hostname) || isPrivateIpv6(hostname)) return false;
+  if (hostname === 'localhost') return false;
+
+  const ips = await resolveHostIps(hostname);
+  if (ips.length === 0) {
+    // Could not resolve at all — fail closed.
+    return false;
+  }
+
+  return ips.every((ip) => !isPrivateIpv4(ip) && !isPrivateIpv6(ip));
+}
+
+/**
+ * Follow redirects from `startUrl` one hop at a time, validating each
+ * hop's destination before connecting. Returns the chain of URLs visited
+ * and the final resolved URL (or as far as it safely got).
+ */
+async function resolveRedirects(startUrl) {
+  const hops = [];
+  let current = startUrl;
+  let truncated = false;
+
+  for (let i = 0; i < MAX_REDIRECTS; i++) {
+    let parsed;
+    try {
+      parsed = new URL(current);
+    } catch (_) {
+      break;
+    }
+
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      // A redirect pointed somewhere non-web (e.g. a custom app scheme).
+      // Stop here; report what we have.
+      break;
+    }
+
+    const safe = await isSafeToFetch(parsed.hostname);
+    if (!safe) {
+      hops.push({ url: current, status: null, blocked: true });
+      truncated = true;
+      break;
+    }
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+
+    let response;
+    try {
+      response = await fetch(current, {
+        method: 'GET',
+        redirect: 'manual',
+        signal: controller.signal,
+        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; QRSentryBot/1.0)' }
+      });
+    } catch (_) {
+      hops.push({ url: current, status: null, blocked: false, error: true });
+      truncated = true;
+      break;
+    } finally {
+      clearTimeout(timeout);
+    }
+
+    const status = response.status;
+    hops.push({ url: current, status });
+
+    const isRedirect = status >= 300 && status < 400;
+    const location = response.headers.get('Location');
+
+    if (!isRedirect || !location) {
+      // Reached the final destination.
+      return { finalUrl: current, hops, hopCount: hops.length, truncated: false };
+    }
+
+    try {
+      current = new URL(location, current).toString();
+    } catch (_) {
+      truncated = true;
+      break;
+    }
+  }
+
+  // Either hit MAX_REDIRECTS, or broke out early above.
+  const last = hops.length ? hops[hops.length - 1].url : startUrl;
+  return { finalUrl: last, hops, hopCount: hops.length, truncated: true };
+}
+
+// ---------------------------------------------------------------------
+// Safe Browsing lookup (unchanged behavior, factored into a function)
+// ---------------------------------------------------------------------
+
+async function lookupSafeBrowsing(targetUrl, apiKey) {
+  const body = {
+    client: { clientId: 'qr-sentry', clientVersion: '1.0.0' },
+    threatInfo: {
+      threatTypes: ['MALWARE', 'SOCIAL_ENGINEERING', 'UNWANTED_SOFTWARE', 'POTENTIALLY_HARMFUL_APPLICATION'],
+      platformTypes: ['ANY_PLATFORM'],
+      threatEntryTypes: ['URL'],
+      threatEntries: [{ url: targetUrl }]
+    }
+  };
+
+  const response = await fetch(`${SAFE_BROWSING_ENDPOINT}?key=${encodeURIComponent(apiKey)}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+
+  if (!response.ok) {
+    throw new Error('upstream-error');
+  }
+
+  const data = await response.json();
+  const matches = Array.isArray(data.matches) ? data.matches : [];
+
+  if (matches.length === 0) {
+    return { flagged: false, threatTypes: [] };
+  }
+
+  const threatTypes = [...new Set(matches.map((m) => m.threatType).filter(Boolean))];
+  return { flagged: true, threatTypes };
+}
+
+// ---------------------------------------------------------------------
+// Request handlers
+// ---------------------------------------------------------------------
+
+async function handleSafeBrowsing(targetUrl, env, origin) {
+  const apiKey = env.SAFE_BROWSING_API_KEY;
+  if (!apiKey) {
+    return jsonResponse({ error: 'Service temporarily unavailable' }, 503, origin);
+  }
+
+  try {
+    const result = await lookupSafeBrowsing(targetUrl, apiKey);
+    return jsonResponse(result, 200, origin);
+  } catch (_) {
+    return jsonResponse({ error: 'Upstream Safe Browsing error' }, 502, origin);
+  }
+}
+
+async function handleResolve(targetUrl, origin) {
+  try {
+    const result = await resolveRedirects(targetUrl);
+    // Strip internal-only fields before returning; keep the response shape
+    // small and predictable for the frontend.
+    const hops = result.hops.map((h) => ({ url: h.url, status: h.status }));
+    return jsonResponse(
+      { finalUrl: result.finalUrl, hops, hopCount: result.hopCount, truncated: result.truncated },
+      200,
+      origin
+    );
+  } catch (_) {
+    return jsonResponse({ error: 'Could not resolve redirects' }, 502, origin);
+  }
+}
+
 export default {
   async fetch(request, env) {
     const origin = request.headers.get('Origin') || '';
+    const url = new URL(request.url);
 
     // Preflight
     if (request.method === 'OPTIONS') {
@@ -118,52 +382,11 @@ export default {
       return jsonResponse({ error: 'A valid http(s) "url" field is required' }, 400, origin);
     }
 
-    const apiKey = env.SAFE_BROWSING_API_KEY;
-    if (!apiKey) {
-      // Misconfiguration on the server side — don't leak details to the client.
-      return jsonResponse({ error: 'Service temporarily unavailable' }, 503, origin);
+    if (url.pathname === '/resolve') {
+      return handleResolve(targetUrl, origin);
     }
 
-    const sbRequestBody = {
-      client: { clientId: 'qr-sentry', clientVersion: '1.0.0' },
-      threatInfo: {
-        threatTypes: ['MALWARE', 'SOCIAL_ENGINEERING', 'UNWANTED_SOFTWARE', 'POTENTIALLY_HARMFUL_APPLICATION'],
-        platformTypes: ['ANY_PLATFORM'],
-        threatEntryTypes: ['URL'],
-        threatEntries: [{ url: targetUrl }]
-      }
-    };
-
-    let sbResponse;
-    try {
-      sbResponse = await fetch(`${SAFE_BROWSING_ENDPOINT}?key=${encodeURIComponent(apiKey)}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(sbRequestBody)
-      });
-    } catch (_) {
-      return jsonResponse({ error: 'Upstream request failed' }, 502, origin);
-    }
-
-    if (!sbResponse.ok) {
-      // Don't forward upstream error bodies verbatim (they could contain
-      // the key in some edge cases, or just be unnecessarily verbose).
-      return jsonResponse({ error: 'Upstream Safe Browsing error' }, 502, origin);
-    }
-
-    let sbData;
-    try {
-      sbData = await sbResponse.json();
-    } catch (_) {
-      return jsonResponse({ error: 'Upstream returned malformed data' }, 502, origin);
-    }
-
-    const matches = Array.isArray(sbData.matches) ? sbData.matches : [];
-    if (matches.length === 0) {
-      return jsonResponse({ flagged: false, threatTypes: [] }, 200, origin);
-    }
-
-    const threatTypes = [...new Set(matches.map((m) => m.threatType).filter(Boolean))];
-    return jsonResponse({ flagged: true, threatTypes }, 200, origin);
+    // Default / legacy route: Safe Browsing lookup.
+    return handleSafeBrowsing(targetUrl, env, origin);
   }
 };
