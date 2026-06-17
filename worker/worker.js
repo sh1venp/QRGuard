@@ -204,6 +204,46 @@ async function isSafeToFetch(hostname) {
 }
 
 /**
+ * Some link shorteners (TinyURL among them, depending on configuration)
+ * serve an HTML interstitial page with a 200 status instead of an HTTP
+ * 3xx redirect — the actual destination is embedded as a meta-refresh tag
+ * or a small inline script. This is a best-effort fallback to extract that
+ * destination when no Location header was present. Returns null if no
+ * redirect-like pattern is found, in which case the page genuinely IS the
+ * final destination.
+ */
+function extractHtmlRedirectTarget(html, baseUrl) {
+  if (!html || typeof html !== 'string') return null;
+
+  // <meta http-equiv="refresh" content="0;url=https://example.com">
+  const metaMatch = html.match(
+    /<meta[^>]+http-equiv=["']?refresh["']?[^>]+content=["']?[^"'>]*url=([^"'>\s]+)/i
+  );
+  if (metaMatch) {
+    try {
+      return new URL(metaMatch[1], baseUrl).toString();
+    } catch (_) {
+      /* fall through to other patterns */
+    }
+  }
+
+  // window.location = "..." / window.location.href = "..." / location.replace("...")
+  const jsMatch = html.match(
+    /(?:window\.)?location(?:\.href)?\s*=\s*["']([^"']+)["']|location\.replace\(\s*["']([^"']+)["']\s*\)/i
+  );
+  if (jsMatch) {
+    const target = jsMatch[1] || jsMatch[2];
+    try {
+      return new URL(target, baseUrl).toString();
+    } catch (_) {
+      /* fall through */
+    }
+  }
+
+  return null;
+}
+
+/**
  * Follow redirects from `startUrl` one hop at a time, validating each
  * hop's destination before connecting. Returns the chain of URLs visited
  * and the final resolved URL (or as far as it safely got).
@@ -243,7 +283,10 @@ async function resolveRedirects(startUrl) {
         method: 'GET',
         redirect: 'manual',
         signal: controller.signal,
-        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; QRSentryBot/1.0)' }
+        headers: {
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+        }
       });
     } catch (_) {
       hops.push({ url: current, status: null, blocked: false, error: true });
@@ -254,22 +297,61 @@ async function resolveRedirects(startUrl) {
     }
 
     const status = response.status;
+    const isRedirect = status >= 300 && status < 400;
+    const headerLocation = response.headers.get('Location');
+
+    if (isRedirect && headerLocation) {
+      hops.push({ url: current, status });
+      try {
+        current = new URL(headerLocation, current).toString();
+        continue;
+      } catch (_) {
+        truncated = true;
+        break;
+      }
+    }
+
+    // No HTTP-level redirect. Check whether this is an HTML interstitial
+    // with a meta-refresh or JS-based redirect instead — but only bother
+    // reading the body for plausible HTML responses, and cap how much we
+    // read so a huge page can't stall the Worker.
+    const contentType = response.headers.get('Content-Type') || '';
+    let htmlTarget = null;
+
+    if (status === 200 && contentType.includes('html')) {
+      try {
+        const reader = response.body.getReader();
+        let received = '';
+        const MAX_BYTES = 50_000; // interstitial pages are tiny; real content isn't needed
+        let bytesRead = 0;
+        const decoder = new TextDecoder();
+
+        while (bytesRead < MAX_BYTES) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          bytesRead += value.length;
+          received += decoder.decode(value, { stream: true });
+        }
+        try {
+          await reader.cancel();
+        } catch (_) {
+          /* ignore */
+        }
+
+        htmlTarget = extractHtmlRedirectTarget(received, current);
+      } catch (_) {
+        // Body read failed — treat as "no redirect found", not an error.
+      }
+    }
+
     hops.push({ url: current, status });
 
-    const isRedirect = status >= 300 && status < 400;
-    const location = response.headers.get('Location');
-
-    if (!isRedirect || !location) {
-      // Reached the final destination.
+    if (!htmlTarget || htmlTarget === current) {
+      // Genuinely the final destination.
       return { finalUrl: current, hops, hopCount: hops.length, truncated: false };
     }
 
-    try {
-      current = new URL(location, current).toString();
-    } catch (_) {
-      truncated = true;
-      break;
-    }
+    current = htmlTarget;
   }
 
   // Either hit MAX_REDIRECTS, or broke out early above.

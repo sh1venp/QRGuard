@@ -398,6 +398,7 @@
     }
 
     const sameDestination = finalUrlObj.toString() === shortenerResult.url.toString();
+    const madeNoProgress = sameDestination && resolved.hopCount <= 1;
     const finalAnalysis = sameDestination ? shortenerResult.analysis : QRAnalyzer.analyzeUrl(finalUrlObj, resolved.finalUrl);
 
     // Merge: keep the "this is a shortened link" finding, add everything
@@ -405,22 +406,46 @@
     // where it actually leads.
     const mergedFindings = [];
 
-    mergedFindings.push({
-      severity: resolved.truncated ? 'medium' : 'info',
-      title: resolved.truncated ? 'Could not fully resolve the destination' : 'Shortened link resolved',
-      detail: resolved.truncated
-        ? `We followed ${resolved.hopCount} redirect${resolved.hopCount === 1 ? '' : 's'} but could not safely reach a final destination ` +
+    if (resolved.truncated) {
+      mergedFindings.push({
+        severity: 'medium',
+        title: 'Could not fully resolve the destination',
+        detail:
+          `We followed ${resolved.hopCount} redirect${resolved.hopCount === 1 ? '' : 's'} but could not safely reach a final destination ` +
           '(it may point at a private/internal address, an unsupported link type, or too many redirects). Treat this link with extra caution.'
-        : `This shortened link leads to: ${finalUrlObj.hostname}${finalUrlObj.pathname}` +
+      });
+    } else if (madeNoProgress) {
+      mergedFindings.push({
+        severity: 'medium',
+        title: "Couldn't verify where this link leads",
+        detail:
+          `We weren't able to detect a redirect from this shortened link — it may use a method we don't recognize, ` +
+          'or require manual interaction to proceed. We were unable to confirm the real destination, so treat this link with extra caution before opening it.'
+      });
+    } else {
+      mergedFindings.push({
+        severity: 'info',
+        title: 'Shortened link resolved',
+        detail:
+          `This shortened link leads to: ${finalUrlObj.hostname}${finalUrlObj.pathname}` +
           (resolved.hopCount > 1 ? ` (via ${resolved.hopCount - 1} intermediate redirect${resolved.hopCount - 1 === 1 ? '' : 's'})` : '')
-    });
+      });
+    }
 
-    mergedFindings.push(...finalAnalysis.findings);
+    // Only append the destination's own findings if we actually reached
+    // somewhere different from the shortener itself — otherwise we'd be
+    // re-listing findings about the shortener's own domain as if they
+    // were about "the destination," which would be confusing.
+    if (!madeNoProgress) {
+      mergedFindings.push(...finalAnalysis.findings);
+    }
 
     const merged = finalize_compat(mergedFindings);
 
     setVerdict(merged.verdict, merged.label, merged.score);
-    if (merged.verdict === 'high') {
+    if (madeNoProgress) {
+      verdictSub.textContent = "We couldn't confirm where this shortened link actually leads.";
+    } else if (merged.verdict === 'high') {
       verdictSub.textContent = 'The destination of this shortened link shows strong signs of being unsafe.';
     } else if (merged.verdict === 'medium') {
       verdictSub.textContent = 'A few things about where this link leads are worth double-checking.';
