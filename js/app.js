@@ -24,14 +24,11 @@
 
   // ---- DOM references -------------------------------------------------
   const viewHome = $('view-home');
-  const viewScanner = $('view-scanner');
   const viewResults = $('view-results');
 
   const startScanBtn = $('start-scan-btn');
-  const cancelScanBtn = $('cancel-scan-btn');
   const scannerStatus = $('scanner-status');
   const homeStatus = $('home-status');
-  const fileInput = $('file-input');
 
   const verdictCard = $('verdict-card');
   const verdictRing = $('verdict-ring');
@@ -87,19 +84,26 @@
 
   // ---- State --------------------------------------------------------------
   let html5QrCode = null;
-  let fileScanner = null;
   let acceptingScans = false;
-  let currentOpenUrl = null; // URL object, only set when "Open" is safe to show
+  let currentOpenUrl = null;
   let currentVerdict = 'low';
 
   // -----------------------------------------------------------------------
   // View management
   // -----------------------------------------------------------------------
   function showView(view) {
-    for (const v of [viewHome, viewScanner, viewResults]) {
+    for (const v of [viewHome, viewResults]) {
       v.hidden = v !== view;
     }
-    window.scrollTo(0, 0);
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }
+
+  function scrollToResults() {
+    // Results section is shown within the page flow — scroll it into view
+    // smoothly so the user's eye is drawn straight to the verdict card.
+    setTimeout(() => {
+      viewResults.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }, 80); // brief delay so the DOM is fully painted before scrolling
   }
 
   // -----------------------------------------------------------------------
@@ -236,38 +240,45 @@
   // -----------------------------------------------------------------------
   // Camera scanning
   // -----------------------------------------------------------------------
-  startScanBtn.addEventListener('click', startScanning);
 
-  cancelScanBtn.addEventListener('click', async () => {
-    acceptingScans = false;
-    await stopScanning();
-    showView(viewHome);
+  // "Scan a QR code" button restarts the camera if it was stopped (e.g.
+  // after a scan result was shown and the user wants to scan again).
+  startScanBtn.addEventListener('click', () => {
+    homeStatus.textContent = '';
+    if (!html5QrCode || !acceptingScans) {
+      startScanning();
+    }
   });
 
   async function startScanning() {
-    homeStatus.textContent = '';
-    showView(viewScanner);
-    scannerStatus.textContent = 'Requesting camera access\u2026';
     acceptingScans = true;
+    scannerStatus.textContent = 'Point your camera at a QR code';
 
     if (typeof Html5Qrcode === 'undefined') {
       scannerStatus.textContent = 'The QR scanning library failed to load.';
       return;
     }
 
-    html5QrCode = new Html5Qrcode(SCANNER_ELEMENT_ID);
+    if (!html5QrCode) {
+      html5QrCode = new Html5Qrcode(SCANNER_ELEMENT_ID);
+    }
 
     const config = {
       fps: 10,
-      qrbox: (viewfinderWidth, viewfinderHeight) => {
-        const size = Math.floor(Math.min(viewfinderWidth, viewfinderHeight) * 0.7);
+      qrbox: (w, h) => {
+        const size = Math.floor(Math.min(w, h) * 0.7);
         return { width: size, height: size };
       },
       aspectRatio: 1.0
     };
 
     try {
-      await html5QrCode.start({ facingMode: 'environment' }, config, onScanSuccess, onScanFailure);
+      await html5QrCode.start(
+        { facingMode: 'environment' },
+        config,
+        onScanSuccess,
+        () => {} // silent per-frame failure, expected while no code is visible
+      );
       scannerStatus.textContent = 'Point your camera at a QR code';
     } catch (err) {
       scannerStatus.textContent = describeCameraError(err);
@@ -281,33 +292,21 @@
     processResult(decodedText);
   }
 
-  // Called continuously while no code is found in the frame — intentionally a no-op.
-  function onScanFailure(_message) {}
-
   async function stopScanning() {
     if (html5QrCode) {
-      try {
-        await html5QrCode.stop();
-      } catch (_) {
-        // may already be stopped
-      }
-      try {
-        html5QrCode.clear();
-      } catch (_) {
-        // ignore
-      }
+      try { await html5QrCode.stop(); } catch (_) {}
+      try { html5QrCode.clear(); } catch (_) {}
       html5QrCode = null;
     }
   }
 
   function describeCameraError(err) {
     const name = (err && err.name) || '';
-
     if (location.protocol !== 'https:' && location.hostname !== 'localhost' && location.hostname !== '127.0.0.1') {
       return 'Camera access requires a secure (HTTPS) connection.';
     }
     if (name === 'NotAllowedError' || /permission/i.test(String(err))) {
-      return 'Camera access was denied. Allow camera access for this site in your browser settings and try again.';
+      return 'Camera access was denied. Allow camera access for this site in your browser settings, then tap "Scan a QR code" to try again.';
     }
     if (name === 'NotFoundError') {
       return 'No camera was found on this device.';
@@ -315,36 +314,11 @@
     if (name === 'NotReadableError') {
       return 'The camera is already in use by another app.';
     }
-    return 'Could not access the camera. You can also upload a photo of a QR code from the home screen.';
+    return 'Could not access the camera. Check that this site has camera permission in your browser settings.';
   }
 
-  // -----------------------------------------------------------------------
-  // File-based scanning
-  // -----------------------------------------------------------------------
-  fileInput.addEventListener('change', async () => {
-    const file = fileInput.files && fileInput.files[0];
-    fileInput.value = ''; // allow re-selecting the same file later
-    if (!file) return;
-
-    if (typeof Html5Qrcode === 'undefined') {
-      homeStatus.textContent = 'The QR scanning library failed to load.';
-      return;
-    }
-
-    homeStatus.textContent = 'Reading image\u2026';
-
-    if (!fileScanner) {
-      fileScanner = new Html5Qrcode(SCANNER_ELEMENT_ID);
-    }
-
-    try {
-      const decodedText = await fileScanner.scanFile(file, false);
-      homeStatus.textContent = '';
-      processResult(decodedText);
-    } catch (_) {
-      homeStatus.textContent = 'No QR code was found in that image.';
-    }
-  });
+  // Auto-start camera on page load.
+  startScanning();
 
   // -----------------------------------------------------------------------
   // Result handling
@@ -353,7 +327,10 @@
     const result = QRAnalyzer.classify(rawText);
     renderResult(result);
     saveHistoryEntry(toHistoryEntry(result));
-    showView(viewResults);
+
+    // Show results section below the camera and scroll to it smoothly.
+    viewResults.hidden = false;
+    scrollToResults();
 
     if (result.type === 'url') {
       if (result.isShortener) {
@@ -720,6 +697,8 @@
   });
 
   scanAgainBtn.addEventListener('click', () => {
+    viewResults.hidden = true;
+    window.scrollTo({ top: 0, behavior: 'smooth' });
     startScanning();
   });
 
