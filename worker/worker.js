@@ -36,7 +36,7 @@
 // Add every origin that's allowed to call this Worker. Update this when
 // you know your final GitHub Pages URL (and a custom domain, if any).
 const ALLOWED_ORIGINS = [
-  'https://sh1venp.github.io/QRSentry',
+  'https://sh1venp.github.io',
   'http://localhost:8080',
   'http://127.0.0.1:8080'
 ];
